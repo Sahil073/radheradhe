@@ -1,25 +1,106 @@
 """
-Firebase service
-Handles sensor data (from ESP32) and command writing (to relays)
+Enhanced Firebase service with retry logic and error handling
 """
 
 import firebase_admin
 from firebase_admin import credentials, db
 from config import Config
+import time
+import logging
+from services.database_service import cache_energy_data, store_energy_data
+
+logger = logging.getLogger(__name__)
 
 # Initialize Firebase app only once
 if not firebase_admin._apps:
-    cred = credentials.Certificate("firebase-key.json")  # Add your service account key
-    firebase_admin.initialize_app(cred, {
-        "databaseURL": Config.FIREBASE_DB_URL
-    })
+    try:
+        cred = credentials.Certificate(Config.FIREBASE_CREDENTIALS_PATH)
+        firebase_admin.initialize_app(cred, {
+            "databaseURL": Config.FIREBASE_DB_URL
+        })
+        logger.info("Firebase initialized successfully")
+    except Exception as e:
+        logger.error(f"Firebase initialization failed: {e}")
 
 def get_sensor_data():
-    """Fetch latest sensor data from Firebase"""
-    ref = db.reference("sensors/")
-    return ref.get()
+    """Fetch latest sensor data from Firebase with caching"""
+    try:
+        ref = db.reference("sensors/")
+        data = ref.get()
+        
+        if data:
+            # Cache and store data for each zone
+            for zone, zone_data in data.items():
+                cache_energy_data(zone, zone_data)
+                store_energy_data(zone, zone_data)
+                
+        return data or {}
+        
+    except Exception as e:
+        logger.error(f"Error fetching sensor data: {e}")
+        return {}
 
-def set_command(zone, command):
-    """Send command (ON/OFF) to a zone via Firebase"""
-    ref = db.reference(f"commands/{zone}")
-    ref.set(command)
+def set_command(zone, command, retry_count=3):
+    """
+    Send command (ON/OFF) to a zone via Firebase with retry logic
+    """
+    for attempt in range(retry_count):
+        try:
+            ref = db.reference(f"commands/{zone}")
+            ref.set({
+                "command": command,
+                "timestamp": time.time(),
+                "attempt": attempt + 1
+            })
+            
+            logger.info(f"Command sent successfully: {zone} -> {command}")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Command attempt {attempt + 1} failed: {e}")
+            if attempt < retry_count - 1:
+                time.sleep(1)  # Wait before retry
+            
+    logger.error(f"Failed to send command after {retry_count} attempts")
+    return False
+
+def get_zone_status(zone):
+    """Get current status of a specific zone"""
+    try:
+        ref = db.reference(f"status/{zone}")
+        return ref.get() or {}
+    except Exception as e:
+        logger.error(f"Error getting zone status: {e}")
+        return {}
+
+def set_zone_status(zone, status):
+    """Update zone status in Firebase"""
+    try:
+        ref = db.reference(f"status/{zone}")
+        ref.set({
+            **status,
+            "lastUpdated": time.time()
+        })
+        return True
+    except Exception as e:
+        logger.error(f"Error setting zone status: {e}")
+        return False
+
+def get_all_zone_commands():
+    """Get all pending commands"""
+    try:
+        ref = db.reference("commands/")
+        return ref.get() or {}
+    except Exception as e:
+        logger.error(f"Error getting commands: {e}")
+        return {}
+
+def clear_command(zone):
+    """Clear executed command"""
+    try:
+        ref = db.reference(f"commands/{zone}")
+        ref.delete()
+        return True
+    except Exception as e:
+        logger.error(f"Error clearing command: {e}")
+        return False

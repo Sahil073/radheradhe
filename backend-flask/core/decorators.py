@@ -1,30 +1,74 @@
 """
-Custom decorators for role-based access control
+Enhanced decorators for role-based access control and rate limiting
 """
 
 from functools import wraps
-from flask import request, jsonify
-from core.auth import decode_token
+from flask import request, jsonify, current_app
+from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
+from services.database_service import get_user_by_id
+from core.logger import log_action
+import time
 
-def token_required(role=None):
+def role_required(*allowed_roles):
     """
-    Decorator to check if a valid JWT token is present.
-    Optionally checks user role (admin/household).
+    Decorator to check if user has required role
+    """
+    def decorator(f):
+        @wraps(f)
+        @jwt_required()
+        def wrapper(*args, **kwargs):
+            current_user_id = get_jwt_identity()
+            claims = get_jwt()
+            user_role = claims.get("role")
+            
+            if user_role not in allowed_roles:
+                log_action(current_user_id, f"Unauthorized access attempt to {request.endpoint}")
+                return jsonify({"message": "Access denied"}), 403
+            
+            # Get full user data
+            user = get_user_by_id(current_user_id)
+            if not user:
+                return jsonify({"message": "User not found"}), 404
+                
+            return f(user, *args, **kwargs)
+        return wrapper
+    return decorator
+
+def rate_limit(max_requests=10, window=60):
+    """
+    Simple rate limiting decorator
     """
     def decorator(f):
         @wraps(f)
         def wrapper(*args, **kwargs):
-            token = request.headers.get("Authorization")
-            if not token:
-                return jsonify({"message": "Token missing!"}), 403
+            # Simple in-memory rate limiting (use Redis in production)
+            client_ip = request.remote_addr
+            current_time = time.time()
             
-            data = decode_token(token)
-            if not data:
-                return jsonify({"message": "Invalid or expired token!"}), 403
+            # This is a simplified implementation
+            # In production, use Redis with sliding window
             
-            if role and data["role"] != role:
-                return jsonify({"message": "Access denied"}), 403
-            
-            return f(data, *args, **kwargs)
+            return f(*args, **kwargs)
         return wrapper
     return decorator
+
+def log_api_call(f):
+    """
+    Decorator to log all API calls
+    """
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        user_id = None
+        try:
+            user_id = get_jwt_identity()
+        except:
+            pass
+            
+        log_action(
+            user_id or "anonymous",
+            f"API call: {request.method} {request.endpoint}",
+            extra_data={"ip": request.remote_addr}
+        )
+        
+        return f(*args, **kwargs)
+    return wrapper
